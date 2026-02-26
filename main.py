@@ -1,30 +1,20 @@
+# main.py – video-only with thumbnail, preview & range-request support
 import asyncio
 import re
-import uuid
 from typing import Optional
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse, quote
 
 import aiohttp
-import aiofiles
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel, HttpUrl
-import json
-import os
-import time
-import tempfile
-from pathlib import Path
+from fastapi.responses import StreamingResponse, Response
+from pydantic import BaseModel
 import logging
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(
-    title="PinDrop API",
-    description="High-performance Pinterest media downloader API",
-    version="1.0.0"
-)
+app = FastAPI(title="PinDrop Video Downloader", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -32,51 +22,49 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition", "Content-Length", "Content-Range", "Accept-Ranges"],
 )
-
-TEMP_DIR = Path(tempfile.gettempdir()) / "pindrop"
-TEMP_DIR.mkdir(exist_ok=True)
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.5",
-    "Accept-Encoding": "gzip, deflate, br",
-    "DNT": "1",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Cache-Control": "max-age=0",
+    "Referer": "https://www.pinterest.com/",
+    "Origin": "https://www.pinterest.com",
 }
+
+
+def safe_filename(filename: str, max_bytes: int = 200) -> str:
+    safe = re.sub(r'[^\w\-_\. ]', '_', filename).strip()
+    if not safe:
+        safe = "pinterest_video"
+    while len(safe.encode('utf-8')) > max_bytes:
+        safe = safe[:-1]
+    return safe
+
+
+def content_disposition_filename(filename: str, as_attachment: bool = True) -> str:
+    safe_ascii = safe_filename(filename)
+    try:
+        safe_ascii.encode('ascii')
+        disp = 'attachment' if as_attachment else 'inline'
+        return f'{disp}; filename="{safe_ascii}"'
+    except UnicodeEncodeError:
+        encoded = quote(safe_ascii.encode('utf-8'), safe='')
+        disp = 'attachment' if as_attachment else 'inline'
+        return f"{disp}; filename*=utf-8''{encoded}"
 
 
 class PinRequest(BaseModel):
     url: str
 
 
-class MediaInfo(BaseModel):
-    id: str
-    type: str  # "image", "video", "gif"
-    url: str
-    thumbnail: str
-    title: str
-    quality: Optional[str] = None
-    size: Optional[str] = None
-    width: Optional[int] = None
-    height: Optional[int] = None
-
-
 def extract_pin_id(url: str) -> Optional[str]:
-    patterns = [
-        r'pinterest\.com/pin/(\d+)',
-        r'pin\.it/([A-Za-z0-9]+)',
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, url)
-        if match:
-            return match.group(1)
+    patterns = [r'pinterest\.com/pin/(\d+)', r'pin\.it/([A-Za-z0-9]+)']
+    for pat in patterns:
+        m = re.search(pat, url)
+        if m:
+            return m.group(1)
     return None
 
 
@@ -95,187 +83,108 @@ async def fetch_pin_data(url: str) -> dict:
     timeout = aiohttp.ClientTimeout(total=30)
 
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-        # Resolve short links
         url = await resolve_shortlink(url, session)
-
         pin_id = extract_pin_id(url)
 
-        results = []
+        if not pin_id:
+            raise HTTPException(400, "Could not extract Pin ID from URL")
 
-        # Try Pinterest API first (fastest)
-        if pin_id:
-            api_url = f"https://www.pinterest.com/resource/PinResource/get/?source_url=/pin/{pin_id}/&data=%7B%22options%22%3A%7B%22id%22%3A%22{pin_id}%22%2C%22field_set_key%22%3A%22unauth_react%22%7D%7D"
-
-            try:
-                async with session.get(api_url, headers={**HEADERS, "X-Requested-With": "XMLHttpRequest",
-                                                         "Accept": "application/json"}) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        pin_data = data.get("resource_response", {}).get("data", {})
-
-                        if pin_data:
-                            return parse_pin_resource(pin_data, pin_id)
-            except Exception as e:
-                logger.warning(f"API fetch failed: {e}")
-
-        # Fallback: scrape HTML
+        api_url = (
+            f"https://www.pinterest.com/resource/PinResource/get/"
+            f"?source_url=/pin/{pin_id}/"
+            f"&data=%7B%22options%22%3A%7B%22id%22%3A%22{pin_id}%22%2C%22field_set_key%22%3A%22unauth_react%22%7D%7D"
+        )
         try:
-            async with session.get(url, headers=HEADERS) as resp:
-                if resp.status == 200:
-                    html = await resp.text()
-                    return parse_html_for_media(html, pin_id or "unknown", url)
+            async with session.get(api_url, headers={**HEADERS, "X-Requested-With": "XMLHttpRequest"}) as resp:
+                if resp.status != 200:
+                    raise Exception("API returned non-200")
+                data = await resp.json()
+                pin_data = data.get("resource_response", {}).get("data", {})
+                if not pin_data:
+                    raise Exception("No pin data")
+                return parse_pin_data(pin_data, pin_id)
         except Exception as e:
-            logger.error(f"HTML scrape failed: {e}")
+            logger.warning(f"API fetch failed: {e}, falling back to HTML scrape")
+            async with session.get(url, headers=HEADERS) as resp:
+                if resp.status != 200:
+                    raise HTTPException(422, "Could not fetch pin page")
+                html = await resp.text()
+                return parse_html_for_video(html, pin_id)
 
-        raise HTTPException(status_code=422,
-                            detail="Could not extract media from this Pinterest URL. Ensure the URL is public and valid.")
 
-
-def parse_pin_resource(data: dict, pin_id: str) -> dict:
-    media_type = "image"
-    media_url = ""
-    thumbnail = ""
-    title = data.get("title", "") or data.get("description", "Pinterest Pin") or "Pinterest Media"
-    width = None
-    height = None
-
-    # Check for video
+def parse_pin_data(data: dict, pin_id: str) -> dict:
+    title = data.get("title", "") or data.get("description", "Pinterest Video") or "Pinterest Video"
     videos = data.get("videos", {})
-    if videos:
-        video_list = videos.get("video_list", {})
-        if video_list:
-            best_video = None
-            best_quality = 0
-            for quality, vdata in video_list.items():
-                if isinstance(vdata, dict):
-                    w = vdata.get("width", 0) or 0
-                    if w > best_quality:
-                        best_quality = w
-                        best_video = vdata
+    video_list = videos.get("video_list", {})
+    if not video_list:
+        raise HTTPException(422, "This pin does not contain a video")
 
-            if best_video:
-                media_type = "video"
-                media_url = best_video.get("url", "")
-                width = best_video.get("width")
-                height = best_video.get("height")
+    best = None
+    best_width = 0
+    for vdata in video_list.values():
+        if isinstance(vdata, dict):
+            w = vdata.get("width", 0)
+            if w > best_width:
+                best_width = w
+                best = vdata
+    if not best:
+        raise HTTPException(422, "No video URL found")
 
-    # Images
+    video_url = best.get("url", "")
+    width = best.get("width")
+    height = best.get("height")
+
+    thumbnail = ""
     images = data.get("images", {})
     if images:
         orig = images.get("orig", {})
         if orig:
-            if not media_url:
-                media_url = orig.get("url", "")
             thumbnail = orig.get("url", "")
-            if not width:
-                width = orig.get("width")
-            if not height:
-                height = orig.get("height")
-
-    # Check if GIF
-    if media_url and ".gif" in media_url.lower():
-        media_type = "gif"
 
     return {
         "id": pin_id,
-        "type": media_type,
-        "url": media_url,
+        "type": "video",
+        "url": video_url,
         "thumbnail": thumbnail,
-        "title": title[:100] if title else "Pinterest Media",
+        "title": title[:100],
         "width": width,
         "height": height,
+        "quality": f"{width}x{height}" if width and height else "Original",
     }
 
 
-def parse_html_for_media(html: str, pin_id: str, original_url: str) -> dict:
-    media_url = ""
-    thumbnail = ""
-    media_type = "image"
-    title = "Pinterest Media"
+def parse_html_for_video(html: str, pin_id: str) -> dict:
+    video_patterns = [
+        r'"video_url"\s*:\s*"([^"]+\.mp4[^"]*)"',
+        r'"url"\s*:\s*"([^"]+\.mp4[^"]*)"',
+        r'(https://v\d+\.pinimg\.com/[^"\'\\]+\.mp4[^"\'\\]*)',
+    ]
+    video_url = None
+    for pat in video_patterns:
+        m = re.search(pat, html)
+        if m:
+            video_url = m.group(1).replace('\\/', '/').replace('\\u002F', '/')
+            break
+    if not video_url:
+        raise HTTPException(422, "No video found on this pin")
 
-    # Extract title
+    thumb_match = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html)
+    thumbnail = thumb_match.group(1) if thumb_match else ""
+
     title_match = re.search(r'<title[^>]*>([^<]+)</title>', html)
+    title = "Pinterest Video"
     if title_match:
         title = re.sub(r'\s*[|\-–]\s*Pinterest\s*$', '', title_match.group(1)).strip()
 
-    # OG meta tags
-    og_video = re.search(r'<meta[^>]+property=["\']og:video(?::url)?["\'][^>]+content=["\']([^"\']+)["\']', html)
-    og_image = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html)
-
-    if og_video:
-        media_url = og_video.group(1)
-        media_type = "video"
-
-    if og_image:
-        thumbnail = og_image.group(1)
-        if not media_url:
-            media_url = og_image.group(1)
-
-    # Check JSON-LD
-    json_matches = re.findall(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', html, re.DOTALL)
-    for jm in json_matches:
-        try:
-            jdata = json.loads(jm)
-            if isinstance(jdata, list):
-                jdata = jdata[0]
-            if jdata.get("@type") == "VideoObject":
-                cu = jdata.get("contentUrl", "")
-                if cu:
-                    media_url = cu
-                    media_type = "video"
-            thumbnail_url = jdata.get("thumbnailUrl", "")
-            if thumbnail_url and not thumbnail:
-                thumbnail = thumbnail_url
-        except:
-            pass
-
-    # Pinterest video in inline scripts
-    if not media_url or media_type != "video":
-        video_patterns = [
-            r'"video_url"\s*:\s*"([^"]+\.mp4[^"]*)"',
-            r'"url"\s*:\s*"([^"]+\.mp4[^"]*)"',
-            r'(https://v\d+\.pinimg\.com/[^"\'\\]+\.mp4[^"\'\\]*)',
-        ]
-        for pat in video_patterns:
-            m = re.search(pat, html)
-            if m:
-                media_url = m.group(1).replace('\\/', '/').replace('\\u002F', '/')
-                media_type = "video"
-                break
-
-    # High-res image patterns
-    if not media_url or media_type == "image":
-        img_patterns = [
-            r'(https://i\.pinimg\.com/originals/[^"\'\\]+\.(jpg|jpeg|png|gif|webp))',
-            r'(https://i\.pinimg\.com/\d+x/[^"\'\\]+\.(jpg|jpeg|png|gif|webp))',
-        ]
-        for pat in img_patterns:
-            m = re.search(pat, html)
-            if m:
-                img_url = m.group(1)
-                if not media_url:
-                    media_url = img_url
-                if not thumbnail:
-                    thumbnail = img_url
-                if ".gif" in img_url.lower():
-                    media_type = "gif"
-                break
-
-    if ".gif" in media_url.lower():
-        media_type = "gif"
-
-    if not media_url:
-        raise HTTPException(status_code=422,
-                            detail="No downloadable media found. The pin may be private or unsupported.")
-
     return {
         "id": pin_id,
-        "type": media_type,
-        "url": media_url,
-        "thumbnail": thumbnail or media_url,
+        "type": "video",
+        "url": video_url,
+        "thumbnail": thumbnail,
         "title": title[:100],
         "width": None,
         "height": None,
+        "quality": "Original",
     }
 
 
@@ -285,33 +194,25 @@ async def get_file_size(url: str, session: aiohttp.ClientSession) -> Optional[st
             cl = resp.headers.get("Content-Length")
             if cl:
                 size_mb = int(cl) / (1024 * 1024)
-                if size_mb < 1:
-                    return f"{int(size_mb * 1024)} KB"
-                return f"{size_mb:.1f} MB"
+                return f"{size_mb:.1f} MB" if size_mb >= 1 else f"{int(size_mb * 1024)} KB"
     except:
         pass
     return None
 
 
-@app.get("/")
-async def root():
-    return {"status": "PinDrop API running", "version": "1.0.0"}
-
-
-@app.get("/health")
-async def health():
-    return {"status": "healthy", "timestamp": time.time()}
+def _is_allowed_url(url: str) -> bool:
+    parsed = urlparse(url)
+    allowed = ["pinimg.com"]
+    return any(a in parsed.netloc for a in allowed)
 
 
 @app.post("/api/analyze")
 async def analyze_pin(request: PinRequest):
     url = request.url.strip()
-
     if not url:
-        raise HTTPException(status_code=400, detail="URL is required")
-
+        raise HTTPException(400, "URL required")
     if "pinterest" not in url.lower() and "pin.it" not in url.lower():
-        raise HTTPException(status_code=400, detail="Please provide a valid Pinterest URL")
+        raise HTTPException(400, "Please provide a valid Pinterest URL")
 
     try:
         data = await fetch_pin_data(url)
@@ -319,9 +220,8 @@ async def analyze_pin(request: PinRequest):
         raise
     except Exception as e:
         logger.error(f"Unexpected error: {e}")
-        raise HTTPException(status_code=500, detail="Failed to process Pinterest URL")
+        raise HTTPException(500, "Failed to process Pinterest URL")
 
-    # Get file size asynchronously
     connector = aiohttp.TCPConnector(ssl=False)
     async with aiohttp.ClientSession(connector=connector) as session:
         size = await get_file_size(data["url"], session)
@@ -331,77 +231,124 @@ async def analyze_pin(request: PinRequest):
         "media": {
             **data,
             "size": size,
-            "quality": f"{data['width']}x{data['height']}" if data.get("width") and data.get("height") else "Original",
         }
     }
 
 
-@app.get("/api/download")
-async def download_media(url: str, filename: str = "pinterest_media", type: str = "image"):
+@app.get("/api/preview-video")
+async def preview_video(url: str, request: Request):
+    """
+    Stream video for in-page preview with full Range request support.
+    This enables the HTML5 <video> player to seek correctly.
+    """
     if not url:
-        raise HTTPException(status_code=400, detail="URL required")
+        raise HTTPException(400, "URL required")
+    if not _is_allowed_url(url):
+        raise HTTPException(403, "Invalid media URL domain")
 
-    # Validate URL domain
-    parsed = urlparse(url)
-    allowed = ["pinimg.com", "pinterest.com", "v1.pinimg.com", "v2.pinimg.com"]
-    if not any(a in parsed.netloc for a in allowed):
-        raise HTTPException(status_code=403, detail="Invalid media URL domain")
+    range_header = request.headers.get("Range")
 
     connector = aiohttp.TCPConnector(ssl=False)
     timeout = aiohttp.ClientTimeout(total=120)
 
-    ext_map = {"video": "mp4", "gif": "gif", "image": "jpg"}
-    ext = ext_map.get(type, "jpg")
+    upstream_headers = {**HEADERS}
+    if range_header:
+        upstream_headers["Range"] = range_header
 
-    # Clean filename
-    safe_filename = re.sub(r'[^\w\-_\.]', '_', filename)[:50]
-    download_name = f"{safe_filename}.{ext}"
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+        async with session.get(url, headers=upstream_headers) as resp:
+            if resp.status not in (200, 206):
+                raise HTTPException(resp.status, "Failed to fetch video from Pinterest")
 
-    content_type_map = {
-        "video": "video/mp4",
-        "gif": "image/gif",
-        "image": "image/jpeg"
-    }
+            content_type = resp.headers.get("Content-Type", "video/mp4")
+            content_length = resp.headers.get("Content-Length")
+            content_range = resp.headers.get("Content-Range")
+            accept_ranges = resp.headers.get("Accept-Ranges", "bytes")
 
-    async def stream_content():
+            response_headers = {
+                "Accept-Ranges": accept_ranges,
+                "Cache-Control": "no-cache",
+                "Access-Control-Allow-Origin": "*",
+            }
+            if content_length:
+                response_headers["Content-Length"] = content_length
+            if content_range:
+                response_headers["Content-Range"] = content_range
+
+            # Buffer the entire chunk for range responses (avoids generator/session lifetime issues)
+            body = await resp.read()
+
+    status_code = 206 if (range_header and content_range) else 200
+
+    return Response(
+        content=body,
+        status_code=status_code,
+        media_type=content_type,
+        headers=response_headers,
+    )
+
+
+@app.get("/api/download")
+async def download_media(url: str, filename: str = "pinterest_video"):
+    if not url:
+        raise HTTPException(400, "URL required")
+    if not _is_allowed_url(url):
+        raise HTTPException(403, "Invalid media URL domain")
+
+    connector = aiohttp.TCPConnector(ssl=False)
+    timeout = aiohttp.ClientTimeout(total=180)
+
+    safe_base = safe_filename(filename)
+    download_name = f"{safe_base}.mp4"
+    content_disp = content_disposition_filename(download_name, as_attachment=True)
+
+    async def stream_download():
         async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
             async with session.get(url, headers=HEADERS) as resp:
                 if resp.status != 200:
-                    raise HTTPException(status_code=resp.status, detail="Failed to fetch media")
-                async for chunk in resp.content.iter_chunked(65536):  # 64KB chunks for speed
+                    raise HTTPException(resp.status, "Failed to fetch video")
+                async for chunk in resp.content.iter_chunked(65536):
                     yield chunk
 
     return StreamingResponse(
-        stream_content(),
-        media_type=content_type_map.get(type, "application/octet-stream"),
+        stream_download(),
+        media_type="video/mp4",
         headers={
-            "Content-Disposition": f'attachment; filename="{download_name}"',
+            "Content-Disposition": content_disp,
             "Cache-Control": "no-cache",
-            "X-Content-Type-Options": "nosniff",
         }
     )
 
 
 @app.get("/api/proxy-image")
 async def proxy_image(url: str):
-    """Proxy Pinterest images to avoid CORS issues"""
     parsed = urlparse(url)
-    if "pinimg.com" not in parsed.netloc and "pinterest.com" not in parsed.netloc:
-        raise HTTPException(status_code=403, detail="Invalid domain")
+    if "pinimg.com" not in parsed.netloc:
+        raise HTTPException(403, "Invalid domain")
 
     connector = aiohttp.TCPConnector(ssl=False)
     timeout = aiohttp.ClientTimeout(total=15)
 
-    async def stream():
-        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+        try:
             async with session.get(url, headers=HEADERS) as resp:
-                async for chunk in resp.content.iter_chunked(32768):
-                    yield chunk
+                if resp.status != 200:
+                    raise HTTPException(resp.status, "Failed to fetch image")
+                content_type = resp.headers.get("Content-Type", "image/jpeg")
+                body = await resp.read()
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Proxy error: {e}")
+            raise HTTPException(500, str(e))
 
-    return StreamingResponse(stream(), media_type="image/jpeg", headers={"Cache-Control": "public, max-age=3600"})
+    return Response(
+        content=body,
+        media_type=content_type,
+        headers={"Cache-Control": "public, max-age=3600"}
+    )
 
 
 if __name__ == "__main__":
     import uvicorn
-
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True, workers=4)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
