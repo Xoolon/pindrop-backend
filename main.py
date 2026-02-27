@@ -1,11 +1,16 @@
-# main.py – video-only with thumbnail, preview & range-request support
+# main.py – PinDrop backend with Paystack webhook + HMAC token verification
 import asyncio
+import hashlib
+import hmac
+import json
+import os
 import re
+import time
 from typing import Optional
 from urllib.parse import urlparse, quote
 
 import aiohttp
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
@@ -14,11 +19,20 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="PinDrop Video Downloader", version="3.0.0")
+app = FastAPI(title="PinDrop Video Downloader", version="4.0.0")
+
+# ─── ENV VARS (set these in Railway/Render dashboard) ────────────────────────
+# PAYSTACK_SECRET_KEY  → sk_live_xxx  (from Paystack dashboard)
+# TOKEN_SECRET         → any long random string you generate (e.g. openssl rand -hex 32)
+# FRONTEND_URL         → https://www.pindr.site
+
+PAYSTACK_SECRET_KEY = os.environ.get("PAYSTACK_SECRET_KEY", "")
+TOKEN_SECRET        = os.environ.get("TOKEN_SECRET", "change-this-to-a-long-random-secret")
+FRONTEND_URL        = os.environ.get("FRONTEND_URL", "https://www.pindr.site")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[FRONTEND_URL, "https://www.pindr.site", "http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -33,6 +47,201 @@ HEADERS = {
     "Origin": "https://www.pinterest.com",
 }
 
+# ─── Token helpers ────────────────────────────────────────────────────────────
+
+def _sign(payload: str) -> str:
+    """HMAC-SHA256 signature of payload using TOKEN_SECRET."""
+    return hmac.new(
+        TOKEN_SECRET.encode(),
+        payload.encode(),
+        hashlib.sha256
+    ).hexdigest()
+
+
+def generate_premium_token(email: str, plan: str, reference: str) -> str:
+    """
+    Creates a signed token in the format:
+      base64(json_payload).signature
+    The frontend stores this; the backend verifies it on each session restore.
+    Lifetime tokens never expire. Monthly tokens expire in 33 days.
+    """
+    now = int(time.time())
+    expiry = 0 if plan == "lifetime" else now + 33 * 24 * 3600  # 0 = never
+
+    payload = {
+        "email":     email,
+        "plan":      plan,
+        "reference": reference,
+        "iat":       now,
+        "exp":       expiry,
+    }
+    payload_json = json.dumps(payload, separators=(",", ":"))
+    payload_b64  = payload_json.encode().hex()          # hex-encode for URL safety
+    sig          = _sign(payload_b64)
+    return f"{payload_b64}.{sig}"
+
+
+def verify_premium_token(token: str) -> Optional[dict]:
+    """
+    Verifies the token signature and expiry.
+    Returns the payload dict on success, None on failure.
+    """
+    try:
+        parts = token.split(".")
+        if len(parts) != 2:
+            return None
+        payload_b64, sig = parts
+        expected_sig = _sign(payload_b64)
+        if not hmac.compare_digest(sig, expected_sig):
+            return None
+        payload = json.loads(bytes.fromhex(payload_b64).decode())
+        exp = payload.get("exp", 0)
+        if exp != 0 and time.time() > exp:
+            return None
+        return payload
+    except Exception:
+        return None
+
+
+# ─── Paystack helpers ─────────────────────────────────────────────────────────
+
+async def verify_paystack_transaction(reference: str) -> Optional[dict]:
+    """Call Paystack's verify endpoint and return transaction data if successful."""
+    if not PAYSTACK_SECRET_KEY:
+        logger.warning("PAYSTACK_SECRET_KEY not set – skipping server-side verification")
+        return None
+    url = f"https://api.paystack.co/transaction/verify/{reference}"
+    headers = {"Authorization": f"Bearer {PAYSTACK_SECRET_KEY}"}
+    connector = aiohttp.TCPConnector(ssl=True)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        async with session.get(url, headers=headers) as resp:
+            data = await resp.json()
+            if resp.status == 200 and data.get("status") and data["data"].get("status") == "success":
+                return data["data"]
+    return None
+
+
+# ─── API Models ───────────────────────────────────────────────────────────────
+
+class PinRequest(BaseModel):
+    url: str
+
+
+class VerifyPaymentRequest(BaseModel):
+    reference: str
+    email: str
+    plan: str   # "monthly" | "lifetime"
+
+
+class VerifyTokenRequest(BaseModel):
+    token: str
+
+
+# ─── Payment endpoints ────────────────────────────────────────────────────────
+
+@app.post("/api/verify-payment")
+async def verify_payment(req: VerifyPaymentRequest):
+    """
+    Called by the frontend after Paystack popup closes successfully.
+    1. Verifies the transaction with Paystack's API.
+    2. Returns a signed premium token the frontend stores in localStorage.
+    """
+    if not req.reference or not req.email or req.plan not in ("monthly", "lifetime"):
+        raise HTTPException(400, "Invalid request")
+
+    txn = await verify_paystack_transaction(req.reference)
+
+    if txn is None:
+        # If secret key not set (dev mode), issue token anyway with a warning
+        if not PAYSTACK_SECRET_KEY:
+            logger.warning("Dev mode: issuing token without Paystack verification")
+        else:
+            raise HTTPException(402, "Payment not verified. Please contact support.")
+
+    # Extra guard: make sure amounts match expected values
+    if txn:
+        expected_amounts = {"monthly": 100, "lifetime": 2900}   # in cents
+        paid_amount = txn.get("amount", 0)
+        expected    = expected_amounts.get(req.plan, 0)
+        if paid_amount < expected:
+            raise HTTPException(402, f"Incorrect payment amount: got {paid_amount}, expected {expected}")
+
+    token = generate_premium_token(req.email, req.plan, req.reference)
+    logger.info(f"Premium token issued: plan={req.plan} email={req.email} ref={req.reference}")
+
+    return {
+        "success": True,
+        "token":   token,
+        "plan":    req.plan,
+        "email":   req.email,
+    }
+
+
+@app.post("/api/verify-token")
+async def verify_token(req: VerifyTokenRequest):
+    """
+    Called on every app load to verify a stored premium token.
+    The frontend cannot forge this — it requires our TOKEN_SECRET.
+    """
+    payload = verify_premium_token(req.token)
+    if not payload:
+        raise HTTPException(401, "Invalid or expired token")
+
+    return {
+        "valid":  True,
+        "plan":   payload.get("plan"),
+        "email":  payload.get("email"),
+        "expiry": payload.get("exp"),
+    }
+
+
+@app.post("/api/paystack/webhook")
+async def paystack_webhook(request: Request, x_paystack_signature: str = Header(None)):
+    """
+    Paystack sends POST events here for subscription renewals / charges.
+    Set this URL in Paystack dashboard → Settings → API Keys & Webhooks.
+    URL: https://your-backend.railway.app/api/paystack/webhook
+    """
+    body = await request.body()
+
+    # Verify webhook signature
+    if PAYSTACK_SECRET_KEY and x_paystack_signature:
+        expected = hmac.new(
+            PAYSTACK_SECRET_KEY.encode(),
+            body,
+            hashlib.sha512
+        ).hexdigest()
+        if not hmac.compare_digest(expected, x_paystack_signature):
+            raise HTTPException(400, "Invalid webhook signature")
+
+    try:
+        event = json.loads(body)
+    except Exception:
+        raise HTTPException(400, "Invalid JSON")
+
+    event_type = event.get("event", "")
+    data       = event.get("data", {})
+
+    logger.info(f"Paystack webhook: {event_type}")
+
+    if event_type in ("charge.success", "subscription.create"):
+        reference = data.get("reference", "")
+        email     = data.get("customer", {}).get("email", "")
+        plan_code = data.get("plan", {}).get("plan_code", "") if "plan" in data else ""
+        plan      = "monthly" if plan_code else "lifetime"
+        logger.info(f"Payment confirmed via webhook: {email} plan={plan} ref={reference}")
+        # In a real app with a DB you'd upsert a user record here.
+        # Without a DB, the frontend will re-verify via /api/verify-payment.
+
+    elif event_type == "subscription.disable":
+        email = data.get("customer", {}).get("email", "")
+        logger.info(f"Subscription cancelled: {email}")
+        # Token will naturally expire after 33 days. No action needed.
+
+    return {"status": "ok"}
+
+
+# ─── Existing Pinterest endpoints (unchanged) ─────────────────────────────────
 
 def safe_filename(filename: str, max_bytes: int = 200) -> str:
     safe = re.sub(r'[^\w\-_\. ]', '_', filename).strip()
@@ -53,10 +262,6 @@ def content_disposition_filename(filename: str, as_attachment: bool = True) -> s
         encoded = quote(safe_ascii.encode('utf-8'), safe='')
         disp = 'attachment' if as_attachment else 'inline'
         return f"{disp}; filename*=utf-8''{encoded}"
-
-
-class PinRequest(BaseModel):
-    url: str
 
 
 def extract_pin_id(url: str) -> Optional[str]:
@@ -142,13 +347,9 @@ def parse_pin_data(data: dict, pin_id: str) -> dict:
             thumbnail = orig.get("url", "")
 
     return {
-        "id": pin_id,
-        "type": "video",
-        "url": video_url,
-        "thumbnail": thumbnail,
-        "title": title[:100],
-        "width": width,
-        "height": height,
+        "id": pin_id, "type": "video", "url": video_url,
+        "thumbnail": thumbnail, "title": title[:100],
+        "width": width, "height": height,
         "quality": f"{width}x{height}" if width and height else "Original",
     }
 
@@ -177,14 +378,9 @@ def parse_html_for_video(html: str, pin_id: str) -> dict:
         title = re.sub(r'\s*[|\-–]\s*Pinterest\s*$', '', title_match.group(1)).strip()
 
     return {
-        "id": pin_id,
-        "type": "video",
-        "url": video_url,
-        "thumbnail": thumbnail,
-        "title": title[:100],
-        "width": None,
-        "height": None,
-        "quality": "Original",
+        "id": pin_id, "type": "video", "url": video_url,
+        "thumbnail": thumbnail, "title": title[:100],
+        "width": None, "height": None, "quality": "Original",
     }
 
 
@@ -202,8 +398,7 @@ async def get_file_size(url: str, session: aiohttp.ClientSession) -> Optional[st
 
 def _is_allowed_url(url: str) -> bool:
     parsed = urlparse(url)
-    allowed = ["pinimg.com"]
-    return any(a in parsed.netloc for a in allowed)
+    return any(a in parsed.netloc for a in ["pinimg.com"])
 
 
 @app.post("/api/analyze")
@@ -226,28 +421,17 @@ async def analyze_pin(request: PinRequest):
     async with aiohttp.ClientSession(connector=connector) as session:
         size = await get_file_size(data["url"], session)
 
-    return {
-        "success": True,
-        "media": {
-            **data,
-            "size": size,
-        }
-    }
+    return {"success": True, "media": {**data, "size": size}}
 
 
 @app.get("/api/preview-video")
 async def preview_video(url: str, request: Request):
-    """
-    Stream video for in-page preview with full Range request support.
-    This enables the HTML5 <video> player to seek correctly.
-    """
     if not url:
         raise HTTPException(400, "URL required")
     if not _is_allowed_url(url):
         raise HTTPException(403, "Invalid media URL domain")
 
     range_header = request.headers.get("Range")
-
     connector = aiohttp.TCPConnector(ssl=False)
     timeout = aiohttp.ClientTimeout(total=120)
 
@@ -260,32 +444,24 @@ async def preview_video(url: str, request: Request):
             if resp.status not in (200, 206):
                 raise HTTPException(resp.status, "Failed to fetch video from Pinterest")
 
-            content_type = resp.headers.get("Content-Type", "video/mp4")
+            content_type   = resp.headers.get("Content-Type", "video/mp4")
             content_length = resp.headers.get("Content-Length")
-            content_range = resp.headers.get("Content-Range")
-            accept_ranges = resp.headers.get("Accept-Ranges", "bytes")
+            content_range  = resp.headers.get("Content-Range")
+            accept_ranges  = resp.headers.get("Accept-Ranges", "bytes")
 
             response_headers = {
                 "Accept-Ranges": accept_ranges,
                 "Cache-Control": "no-cache",
                 "Access-Control-Allow-Origin": "*",
             }
-            if content_length:
-                response_headers["Content-Length"] = content_length
-            if content_range:
-                response_headers["Content-Range"] = content_range
+            if content_length: response_headers["Content-Length"] = content_length
+            if content_range:  response_headers["Content-Range"]  = content_range
 
-            # Buffer the entire chunk for range responses (avoids generator/session lifetime issues)
             body = await resp.read()
 
     status_code = 206 if (range_header and content_range) else 200
-
-    return Response(
-        content=body,
-        status_code=status_code,
-        media_type=content_type,
-        headers=response_headers,
-    )
+    return Response(content=body, status_code=status_code,
+                    media_type=content_type, headers=response_headers)
 
 
 @app.get("/api/download")
@@ -297,10 +473,8 @@ async def download_media(url: str, filename: str = "pinterest_video"):
 
     connector = aiohttp.TCPConnector(ssl=False)
     timeout = aiohttp.ClientTimeout(total=180)
-
     safe_base = safe_filename(filename)
-    download_name = f"{safe_base}.mp4"
-    content_disp = content_disposition_filename(download_name, as_attachment=True)
+    content_disp = content_disposition_filename(f"{safe_base}.mp4", as_attachment=True)
 
     async def stream_download():
         async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
@@ -310,14 +484,8 @@ async def download_media(url: str, filename: str = "pinterest_video"):
                 async for chunk in resp.content.iter_chunked(65536):
                     yield chunk
 
-    return StreamingResponse(
-        stream_download(),
-        media_type="video/mp4",
-        headers={
-            "Content-Disposition": content_disp,
-            "Cache-Control": "no-cache",
-        }
-    )
+    return StreamingResponse(stream_download(), media_type="video/mp4",
+                             headers={"Content-Disposition": content_disp, "Cache-Control": "no-cache"})
 
 
 @app.get("/api/proxy-image")
@@ -339,14 +507,15 @@ async def proxy_image(url: str):
         except HTTPException:
             raise
         except Exception as e:
-            logger.error(f"Proxy error: {e}")
             raise HTTPException(500, str(e))
 
-    return Response(
-        content=body,
-        media_type=content_type,
-        headers={"Cache-Control": "public, max-age=3600"}
-    )
+    return Response(content=body, media_type=content_type,
+                    headers={"Cache-Control": "public, max-age=3600"})
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "version": "4.0.0"}
 
 
 if __name__ == "__main__":
